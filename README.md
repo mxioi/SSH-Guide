@@ -26,6 +26,18 @@ This guide covers:
 
 ---
 
+### SSH Basics (Quick Reference)
+
+If you're new to SSH, these are the files and terms that matter most:
+
+- `private key`: Stays on your client computer. Never copy this to a server.
+- `public key`: Safe to copy to a server. This is what the server checks.
+- `authorized_keys`: The server-side file that lists which public keys are allowed to log in.
+- `known_hosts`: The client-side file that remembers trusted server host keys.
+- `config`: The client-side file that stores host aliases, usernames, and `IdentityFile` settings.
+
+---
+
 ### 1) Clean up the `.ssh` folder (optional)
 
 Sometimes `C:\Users\<user>\.ssh` gets stuck with bad permissions or corrupted files.
@@ -56,6 +68,8 @@ icacls C:\Keys /grant:r "$env:COMPUTERNAME\$env:USERNAME":(OI)(CI)F
 
 > **Important**: Keep `C:\Keys` outside OneDrive or other sync folders!
 
+If you move to another Windows PC later, you can reuse this same pattern: create `C:\Keys`, copy in only the keys you need, and then rebuild or copy your SSH config.
+
 ---
 
 ### 3) Generate separate keypairs (one per server)
@@ -78,6 +92,10 @@ ssh-keygen -t ed25519 -C "yourname@yourpc-homelab" -f C:\Keys\id_ed25519_homelab
 This creates:
 - `C:\Keys\id_ed25519_webserver` (private key)
 - `C:\Keys\id_ed25519_webserver.pub` (public key)
+
+> **Important**: If you use a custom key name such as `id_ed25519_homelab`, OpenSSH will not automatically pick it for arbitrary hosts. Either use `ssh -i C:\Keys\id_ed25519_homelab user@host` or add a `Host` entry with `IdentityFile` and `IdentitiesOnly yes` in your SSH config.
+
+> **Never copy the private key to the server**: Only copy the `.pub` file to the remote machine. The private key stays on the client that initiates the SSH connection.
 
 ---
 
@@ -152,6 +170,8 @@ Host newserver
 '@ | Add-Content "$env:USERPROFILE\.ssh\config" -Encoding ASCII
 ```
 
+If `ssh` or `scp` fails before connecting with an error like `Bad owner or permissions on C:\Users\<user>\.ssh\config`, check the ACL on the config file and remove extra inherited permissions so only your user can access it.
+
 ---
 
 ### 6) Test connections
@@ -167,6 +187,49 @@ ssh homelab
 Debug if needed:
 ```powershell
 ssh -vvv webserver
+```
+
+Show the fully resolved SSH config for a host:
+```powershell
+ssh -G webserver
+```
+
+---
+
+### 7) Setting Up a New Windows Client
+
+Use this checklist when you move to another Windows laptop or desktop:
+
+```powershell
+# 1. Confirm the OpenSSH client is installed
+ssh -V
+
+# 2. Check whether ssh-agent is available
+Get-Service ssh-agent
+
+# 3. Create a dedicated key directory
+mkdir C:\Keys 2>nul
+
+# 4. Re-apply secure permissions
+icacls C:\Keys /inheritance:r
+icacls C:\Keys /grant:r "$env:COMPUTERNAME\$env:USERNAME":(OI)(CI)F
+```
+
+Then:
+
+- Copy only the private keys you intentionally want on that client.
+- Copy the matching `.pub` files.
+- Copy `%USERPROFILE%\.ssh\config` if you want to keep the same host aliases.
+- Copy `known_hosts` only if you want to preserve trusted host records from the old machine.
+- Test each host with `ssh -G hostname` before the first real login.
+- Test each connection with `ssh -v hostname`.
+
+If you use passphrases, start `ssh-agent` and add your keys after copying them:
+
+```powershell
+Start-Service ssh-agent
+Set-Service -Name ssh-agent -StartupType Automatic
+ssh-add C:\Keys\id_ed25519_example
 ```
 
 ---
@@ -319,7 +382,9 @@ ssh-add ~/.ssh/id_ed25519_production
 | Still asked for password | Key not recognized | Check file permissions, verify key is in `authorized_keys` |
 | Permission denied | Wrong key or user | Use `ssh -vvv` to debug, check `IdentityFile` path |
 | Connection refused | SSH not running or firewall | Check service status, verify port 22 is open |
+| Connection timed out during banner exchange | Port is open, but `sshd` is hung or not responding correctly | Restart `sshd`, check logs, verify the SSH service owns port 22 |
 | Host key verification failed | Server changed | Remove old key from `known_hosts` |
+| Bad owner or permissions on `config` | Extra ACLs on `%USERPROFILE%\.ssh\config` | Remove inherited or non-user ACL entries from the config file |
 
 ### Debug Commands
 
@@ -327,12 +392,56 @@ ssh-add ~/.ssh/id_ed25519_production
 # Verbose connection (shows which keys are tried)
 ssh -vvv hostname
 
+# Show the final config values OpenSSH will use
+ssh -G hostname
+
 # Check which key is being used
 ssh -v hostname 2>&1 | findstr "identity"
 
 # Test specific key
 ssh -i C:\Keys\id_ed25519_test user@hostname
+
+# Test whether port 22 is reachable before debugging auth
+Test-NetConnection hostname -Port 22
+
+# Remove a stale host key entry cleanly
+ssh-keygen -R hostname
 ```
+
+### Example Troubleshooting Workflow
+
+Use this quick flow when a host should work with a key but still prompts for a password or fails:
+
+```powershell
+# 1. Confirm the final SSH config for the host alias
+ssh -G myserver
+
+# 2. Confirm port 22 is reachable
+Test-NetConnection myserver -Port 22
+
+# 3. Try a key-only login with verbose output
+ssh -v -o PreferredAuthentications=publickey `
+       -o PasswordAuthentication=no `
+       -o KbdInteractiveAuthentication=no `
+       -o NumberOfPasswordPrompts=0 `
+       myserver
+```
+
+How to read the result:
+
+- If `Test-NetConnection` fails, fix DNS, routing, firewall, or the SSH service first.
+- If SSH connects but times out during banner exchange, the server accepted TCP but `sshd` is not responding correctly.
+- If verbose output shows the wrong `identity file`, fix `IdentityFile` in your SSH config or use `-i`.
+- If verbose output shows `Offering public key` and then `Permission denied`, the server rejected the key. Check the remote `authorized_keys` location and permissions.
+- If verbose output shows `Authenticated ... using "publickey"`, the key path is working and any remaining issue is after login.
+
+### `known_hosts` Notes
+
+`known_hosts` is your client's record of server identities. It does not contain your private keys.
+
+- If a server is rebuilt or its SSH host key changes, you may see `Host key verification failed`.
+- Remove only the stale entry instead of deleting the whole file.
+- Use `ssh-keygen -R hostname` or `ssh-keygen -R 192.168.1.10` to clear the old record safely.
 
 ### Windows-Specific Issues
 

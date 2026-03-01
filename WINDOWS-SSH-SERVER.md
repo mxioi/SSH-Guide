@@ -138,7 +138,7 @@ Restart-Service sshd
 
 ### Issue 2: Domain Account Authentication Format
 
-When connecting to a DC, use domain prefix:
+When connecting to a DC with a domain account, use the domain prefix:
 
 ```powershell
 # Correct formats:
@@ -149,6 +149,15 @@ ssh username@domain@dc.domain.com  # UPN format
 # Wrong (will fail):
 ssh username@dc.domain.com  # Missing domain prefix
 ```
+
+For local Windows accounts on member servers or workstations, use the local username only:
+
+```powershell
+# Local account
+ssh username@server
+```
+
+Do not assume `DOMAIN\username` is always valid. If the server is logging the user as invalid, retry with the exact local account name shown by `whoami` on the server.
 
 ### Issue 3: Administrators vs Domain Admins
 
@@ -176,6 +185,15 @@ Restart-Service sshd
 ### For Administrator Accounts
 
 **CRITICAL**: Admin users **must** use the special administrators_authorized_keys file!
+
+If `C:\ProgramData\ssh\sshd_config` contains:
+
+```text
+Match Group administrators
+    AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys
+```
+
+then any account that is a member of the local `Administrators` group will use `C:\ProgramData\ssh\administrators_authorized_keys` instead of `%USERPROFILE%\.ssh\authorized_keys`.
 
 ```powershell
 # 1. Create/verify the file exists
@@ -257,6 +275,12 @@ SSH Connection Issue?
 │  ├─ Port not listening → Check firewall
 │  └─ Wrong port → Check sshd_config Port directive
 │
+├─ "Connection timed out during banner exchange"
+│  ├─ Port 22 is reachable but sshd is not responding correctly
+│  ├─ Restart-Service sshd
+│  ├─ Verify port 22 is actually owned by OpenSSH
+│  └─ Check OpenSSH/Operational log immediately after a failed attempt
+│
 ├─ "Connection reset" (after host key exchange)
 │  ├─ AllowGroups wrong → Fix for domain accounts
 │  ├─ User not in allowed group → Add to group
@@ -292,6 +316,12 @@ Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 100 |
 # Watch logs in real-time (run before testing)
 Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 1 -Oldest | 
     Select-Object TimeCreated, Message
+
+# Confirm TCP reachability to port 22 from a client
+Test-NetConnection server -Port 22
+
+# Validate sshd config syntax
+sshd -t
 ```
 
 **Common log messages:**
@@ -300,6 +330,42 @@ Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 1 -Oldest |
 - `"Accepted publickey"` → Success!
 - `"Failed password"` → Wrong password or account issue
 - `"Connection closed [preauth]"` → AllowGroups rejection
+
+### Example Troubleshooting Workflow
+
+Use this sequence after a failed key-based login to a Windows SSH server:
+
+```powershell
+# 1. Confirm the SSH service is running
+Get-Service sshd
+
+# 2. Confirm port 22 is listening
+Get-NetTCPConnection -LocalPort 22 -State Listen
+
+# 3. Validate config syntax
+sshd -t
+
+# 4. Check the most recent OpenSSH events
+Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 10 |
+    Format-List TimeCreated, Message
+```
+
+Then retry from the client with:
+
+```powershell
+ssh -v -o PreferredAuthentications=publickey `
+       -o PasswordAuthentication=no `
+       user@server
+```
+
+How to interpret the result:
+
+- If the client never reaches SSH negotiation, check firewall, routing, and whether `sshd` is running.
+- If the client connects but the server never sends a banner, restart `sshd` and re-check the service state.
+- If the client offers a key and the server rejects it, verify the account is using the correct authorized keys file for that account type.
+- If the account is in local `Administrators`, check `C:\ProgramData\ssh\administrators_authorized_keys`.
+- If the account is not in `Administrators`, check `%USERPROFILE%\.ssh\authorized_keys`.
+- If password works but key does not, compare the key fingerprint in the log to the public key file you intended to install.
 
 ---
 
@@ -419,6 +485,9 @@ Restart-Service sshd -Force
 
 # 7. Test with verbose client
 ssh -vvv DOMAIN\username@server
+
+# 8. Compare the client key fingerprint to the key mentioned in the SSH log
+ssh-keygen -lf C:\Keys\id_ed25519_server.pub
 ```
 
 ---
@@ -484,4 +553,3 @@ Common improvements needed:
 - Security hardening examples
 - Integration with enterprise tools (SIEM, monitoring)
 - Automated testing scripts
-
